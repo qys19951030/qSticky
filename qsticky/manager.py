@@ -28,7 +28,8 @@ class PortManager:
         )
         self.gluetun = GluetunClient(
             settings=self.settings,
-            logger=self.logger
+            logger=self.logger,
+            health_status=self.health_status
         )
         self.shutdown_event = asyncio.Event()
         self._first_run = True
@@ -50,24 +51,15 @@ class PortManager:
 
         try:
             new_port = await self.gluetun.get_forwarded_port()
-            self.health_status.gluetun.last_check = now
 
             if not new_port:
-                self.health_status.gluetun.connected = False
-                self.health_status.gluetun.status = ServiceStatus.ERROR
-                self.health_status.gluetun.last_error = "Failed to get forwarded port from Gluetun"
-                self.health_status.gluetun.port = None
                 self.health_status.current_port = None
                 self.health_status.qbittorrent.port_synced = False
-                self.health_status.last_error = "Gluetun port fetch failed"
+                self.health_status.last_error = f"Gluetun: {self.health_status.gluetun.last_error or 'port fetch failed'}"
                 await self.health_manager.update_health_file()
                 return
 
-            self.health_status.gluetun.connected = True
-            self.health_status.gluetun.status = ServiceStatus.OK
-            self.health_status.gluetun.port = new_port
-            self.health_status.gluetun.last_error = None
-            self.health_status.gluetun.last_success = now
+            self.health_status.current_port = new_port
 
             current_qbit_port = await self.qbit.get_current_port()
             self.health_status.qbittorrent.last_check = now
@@ -79,8 +71,9 @@ class PortManager:
                 if self.health_status.qbittorrent.status == ServiceStatus.UNKNOWN:
                     self.health_status.qbittorrent.status = ServiceStatus.ERROR
                     self.health_status.qbittorrent.last_error = "Failed to get current port from qBittorrent"
-                self.health_status.current_port = None
-                self.health_status.last_error = self.health_status.qbittorrent.last_error or "qBittorrent port fetch failed"
+                self.health_status.last_error = (
+                    f"qBittorrent: {self.health_status.qbittorrent.last_error or 'port fetch failed'}"
+                )
                 await self.health_manager.update_health_file()
                 return
 
@@ -88,8 +81,6 @@ class PortManager:
             if self.health_status.qbittorrent.status == ServiceStatus.UNKNOWN:
                 self.health_status.qbittorrent.status = ServiceStatus.OK
                 self.health_status.qbittorrent.last_success = now
-
-            self.health_status.current_port = new_port
 
             if current_qbit_port != new_port:
                 self.logger.info(f"Port change needed: {current_qbit_port} -> {new_port}")
@@ -100,7 +91,6 @@ class PortManager:
                     self.health_status.qbittorrent.port = verified_port
                     if verified_port == new_port:
                         self.logger.info(f"Successfully updated port to {new_port}")
-                        self.health_status.current_port = new_port
                         self.health_status.qbittorrent.port_synced = True
                         self.health_status.qbittorrent.status = ServiceStatus.OK
                         self.health_status.qbittorrent.last_error = None
