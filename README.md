@@ -347,20 +347,95 @@ qsticky - INFO - Initial status - Gluetun: ✓, qBit: ✓, Port: 45720
 
 ## Health Monitoring
 
-qSticky includes Docker health checks and maintains a health status file at `/app/health/status.json`. The health status includes:
-- Overall health status
-- Uptime
-- Last check timestamp
-- Last port change time
-- Current port
-- Last error (if any)
+qSticky includes Docker health checks and maintains a health status file at `/app/health/status.json`. The health status provides detailed, per-service monitoring to help diagnose issues:
 
-The Docker container will be marked as unhealthy if:
+### Health Status File Structure
 
-- The application fails to write health status
-- qBittorrent becomes unreachable
-- Port updates fail repeatedly
-- Other errors occur
+```json
+{
+  "healthy": true,
+  "services": {
+    "gluetun": {
+      "connected": true,
+      "status": "ok",
+      "port": 55000,
+      "last_check": "2025-06-20T10:00:00.000000",
+      "last_error": null,
+      "last_success": "2025-06-20T10:00:00.000000"
+    },
+    "qbittorrent": {
+      "connected": true,
+      "status": "ok",
+      "port": 55000,
+      "port_synced": true,
+      "last_check": "2025-06-20T10:00:00.000000",
+      "last_error": null,
+      "last_success": "2025-06-20T10:00:00.000000"
+    }
+  },
+  "current_port": 55000,
+  "uptime": "0:05:30.123456",
+  "last_check": "2025-06-20T10:00:00.000000",
+  "last_port_change": "2025-06-20T09:00:00.000000",
+  "last_successful_sync": "2025-06-20T10:00:00.000000",
+  "last_error": null,
+  "timestamp": "2025-06-20T10:00:00.000000"
+}
+```
+
+### Top-level Fields
+
+| Field | Description |
+|-------|-------------|
+| `healthy` | Overall health: `true` only if both services are connected AND ports are synced |
+| `current_port` | The forwarded port from Gluetun (the source of truth) |
+| `last_check` | Timestamp of the last polling cycle (updated on every check) |
+| `last_port_change` | Timestamp when the port was last changed in qBittorrent |
+| `last_successful_sync` | Timestamp when ports were last confirmed to be in sync |
+| `last_error` | The most recent error message (if any) |
+| `uptime` | Time since qSticky started |
+| `timestamp` | When this status was written |
+
+### Per-Service Fields (`services.gluetun`, `services.qbittorrent`)
+
+| Field | Description |
+|-------|-------------|
+| `connected` | Whether the service is reachable and responding |
+| `status` | Detailed status: `ok`, `error`, `auth_failed`, `port_mismatch`, or `unknown` |
+| `port` | The port reported by this service |
+| `port_synced` | (qBittorrent only) Whether qBittorrent's port matches Gluetun's |
+| `last_check` | Timestamp of the last check for this specific service |
+| `last_error` | The last error from this service (if any) |
+| `last_success` | Timestamp of the last successful communication with this service |
+
+### Status Values and Troubleshooting
+
+| Status | Service | Meaning | Troubleshooting |
+|--------|---------|---------|-----------------|
+| `ok` | Both | Everything working normally | — |
+| `error` | Gluetun | Failed to get forwarded port (network issue, Gluetun down, or API error) | Check Gluetun logs and container health |
+| `auth_failed` | Gluetun | Authentication to Gluetun API failed | Verify `GLUETUN_AUTH_TYPE`, `GLUETUN_APIKEY` or username/password |
+| `error` | qBittorrent | Failed to connect or get/set port | Check qBittorrent is running and reachable at the configured host/port |
+| `auth_failed` | qBittorrent | qBittorrent rejected credentials (API key or username/password) | Verify `QBITTORRENT_API_KEY` or `QBITTORRENT_USER`/`QBITTORRENT_PASS` |
+| `port_mismatch` | qBittorrent | Port update was sent but verification showed a different port | Check qBittorrent isn't overriding the port via another mechanism |
+| `unknown` | Both | Service hasn't been checked yet | Wait for the next polling cycle |
+
+### Docker Health Check
+
+The Docker health check uses `/app/health/status.json`:
+```yaml
+healthcheck:
+  test: ["CMD", "python3", "-c", "import json; exit(0 if json.load(open('/app/health/status.json'))['healthy'] else 1)"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+```
+
+The container will be marked as unhealthy if:
+- Gluetun cannot be reached or fails to return a port
+- qBittorrent authentication fails or is unreachable
+- Port updates fail verification
+- Ports remain out of sync across polling cycles
 
 ## Support
 If you find qSticky useful and want to support me, here are some completely optional ways to do so:
