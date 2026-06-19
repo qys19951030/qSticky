@@ -5,7 +5,7 @@ import signal
 from datetime import datetime
 from typing import Optional
 
-from .config import HealthStatus, Settings
+from .config import HealthStatus, ServiceStatus, Settings
 from .gluetun import GluetunClient
 from .health import HealthManager
 from .qbittorrent import QBittorrentClient
@@ -15,7 +15,7 @@ class PortManager:
     def __init__(self):
         self.settings = Settings()
         self.logger = self._setup_logger()
-        self.health_status = HealthStatus(healthy=True, last_check=datetime.now())
+        self.health_status = HealthStatus()
         self.health_manager = HealthManager(
             health_status=self.health_status,
             health_file=os.getenv('HEALTH_FILE', '/tmp/health_status.json'),
@@ -30,7 +30,6 @@ class PortManager:
             settings=self.settings,
             logger=self.logger
         )
-        self.current_port: Optional[int] = None
         self.shutdown_event = asyncio.Event()
         self._first_run = True
 
@@ -46,48 +45,104 @@ class PortManager:
         return logger
 
     async def handle_port_change(self) -> None:
+        now = datetime.now()
+        self.health_status.update_last_check()
+
         try:
             new_port = await self.gluetun.get_forwarded_port()
+            self.health_status.gluetun.last_check = now
+
             if not new_port:
-                self.health_status.healthy = False
+                self.health_status.gluetun.connected = False
+                self.health_status.gluetun.status = ServiceStatus.ERROR
+                self.health_status.gluetun.last_error = "Failed to get forwarded port from Gluetun"
+                self.health_status.gluetun.port = None
+                self.health_status.current_port = None
+                self.health_status.qbittorrent.port_synced = False
+                self.health_status.last_error = "Gluetun port fetch failed"
+                await self.health_manager.update_health_file()
                 return
+
+            self.health_status.gluetun.connected = True
+            self.health_status.gluetun.status = ServiceStatus.OK
+            self.health_status.gluetun.port = new_port
+            self.health_status.gluetun.last_error = None
+            self.health_status.gluetun.last_success = now
 
             current_qbit_port = await self.qbit.get_current_port()
+            self.health_status.qbittorrent.last_check = now
+            self.health_status.qbittorrent.port = current_qbit_port
+
             if current_qbit_port is None:
-                self.health_status.healthy = False
+                self.health_status.qbittorrent.connected = False
+                self.health_status.qbittorrent.port_synced = False
+                if self.health_status.qbittorrent.status == ServiceStatus.UNKNOWN:
+                    self.health_status.qbittorrent.status = ServiceStatus.ERROR
+                    self.health_status.qbittorrent.last_error = "Failed to get current port from qBittorrent"
+                self.health_status.current_port = None
+                self.health_status.last_error = self.health_status.qbittorrent.last_error or "qBittorrent port fetch failed"
+                await self.health_manager.update_health_file()
                 return
 
-            self.current_port = new_port
-            self.health_status.healthy = True
+            self.health_status.qbittorrent.connected = True
+            if self.health_status.qbittorrent.status == ServiceStatus.UNKNOWN:
+                self.health_status.qbittorrent.status = ServiceStatus.OK
+                self.health_status.qbittorrent.last_success = now
+
+            self.health_status.current_port = new_port
 
             if current_qbit_port != new_port:
                 self.logger.info(f"Port change needed: {current_qbit_port} -> {new_port}")
                 if await self.qbit.update_port(new_port):
-                    self.health_status.last_port_change = datetime.now()
+                    self.health_status.last_port_change = now
                     verified_port = await self.qbit.get_current_port()
+                    self.health_status.qbittorrent.last_check = now
+                    self.health_status.qbittorrent.port = verified_port
                     if verified_port == new_port:
                         self.logger.info(f"Successfully updated port to {new_port}")
-                        self.current_port = new_port
+                        self.health_status.current_port = new_port
+                        self.health_status.qbittorrent.port_synced = True
+                        self.health_status.qbittorrent.status = ServiceStatus.OK
+                        self.health_status.qbittorrent.last_error = None
+                        self.health_status.qbittorrent.last_success = now
+                        self.health_status.last_successful_sync = now
+                        self.health_status.last_error = None
                     else:
                         self.logger.error(
                             f"Port change verification failed - expected {new_port}, got {verified_port}"
                         )
-                        self.health_status.healthy = False
+                        self.health_status.qbittorrent.port_synced = False
+                        self.health_status.qbittorrent.status = ServiceStatus.PORT_MISMATCH
+                        self.health_status.qbittorrent.last_error = (
+                            f"Port verification failed: expected {new_port}, got {verified_port}"
+                        )
                         self.health_status.last_error = "Port change verification failed"
+                else:
+                    self.health_status.qbittorrent.port_synced = False
+                    self.health_status.qbittorrent.status = ServiceStatus.ERROR
+                    self.health_status.qbittorrent.last_error = "Port update request failed"
+                    self.health_status.last_error = "Port update request failed"
             else:
                 if self._first_run:
                     self.logger.info(f"Initial port check: {new_port} already set correctly")
                 else:
                     self.logger.debug(f"Port {new_port} already set correctly")
-                self.current_port = current_qbit_port
+                self.health_status.qbittorrent.port_synced = True
+                self.health_status.qbittorrent.status = ServiceStatus.OK
+                self.health_status.qbittorrent.last_error = None
+                self.health_status.qbittorrent.last_success = now
+                self.health_status.last_successful_sync = now
+                self.health_status.last_error = None
 
-            await self.health_manager.update_health_file(self.current_port)
+            await self.health_manager.update_health_file()
             self._first_run = False
 
         except Exception as e:
-            self.health_status.healthy = False
             self.health_status.last_error = str(e)
-            await self.health_manager.update_health_file(self.current_port)
+            self.health_status.gluetun.connected = False
+            self.health_status.qbittorrent.connected = False
+            self.health_status.qbittorrent.port_synced = False
+            await self.health_manager.update_health_file()
 
     async def watch_port(self) -> None:
         git_commit = os.getenv('GIT_COMMIT', 'unknown')
@@ -108,8 +163,11 @@ class PortManager:
                 await asyncio.sleep(self.settings.check_interval)
             except Exception as e:
                 self.logger.error(f"Watch error: {str(e)}")
-                self.health_status.healthy = False
                 self.health_status.last_error = str(e)
+                self.health_status.gluetun.connected = False
+                self.health_status.qbittorrent.connected = False
+                self.health_status.qbittorrent.port_synced = False
+                await self.health_manager.update_health_file()
                 await asyncio.sleep(5)
 
     async def cleanup(self) -> None:

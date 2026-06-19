@@ -8,7 +8,7 @@ from typing import Any, Optional
 import aiohttp
 from aiohttp import ClientTimeout
 
-from .config import HealthStatus, Settings
+from .config import HealthStatus, ServiceStatus, Settings
 
 
 class QBittorrentClient:
@@ -102,6 +102,9 @@ class QBittorrentClient:
         return await self._login()
 
     async def _login(self) -> bool:
+        from datetime import datetime
+        now = datetime.now()
+        self.health_status.qbittorrent.last_check = now
         try:
             await self._init_session()
             async with self.session.post(
@@ -121,18 +124,23 @@ class QBittorrentClient:
                         self.last_login_failed = False
                     self.authenticated = True
                     self._logged_in_once = True
-                    self.health_status.healthy = True
-                    self.health_status.last_error = None
+                    self.health_status.qbittorrent.connected = True
+                    self.health_status.qbittorrent.status = ServiceStatus.OK
+                    self.health_status.qbittorrent.last_error = None
+                    self.health_status.qbittorrent.last_success = now
                     return True
 
                 if response.status == 401:
                     self.logger.error("Login failed: invalid credentials (HTTP 401)")
+                    self.health_status.qbittorrent.status = ServiceStatus.AUTH_FAILED
                 else:
                     self.logger.error(
                         f"Login failed with status {response.status}: {content or 'empty response'}"
                     )
-                self.health_status.healthy = False
-                self.health_status.last_error = (
+                    self.health_status.qbittorrent.status = ServiceStatus.ERROR
+                self.health_status.qbittorrent.connected = False
+                self.health_status.qbittorrent.port_synced = False
+                self.health_status.qbittorrent.last_error = (
                     f"Login failed: {response.status} {content}".strip()
                 )
                 self.last_login_failed = True
@@ -140,8 +148,10 @@ class QBittorrentClient:
                 return False
         except Exception as e:
             self.logger.error(f"Login error: {str(e)}")
-            self.health_status.healthy = False
-            self.health_status.last_error = f"Login error: {str(e)}"
+            self.health_status.qbittorrent.connected = False
+            self.health_status.qbittorrent.port_synced = False
+            self.health_status.qbittorrent.status = ServiceStatus.ERROR
+            self.health_status.qbittorrent.last_error = f"Login error: {str(e)}"
             self.last_login_failed = True
             self.authenticated = False
             return False
@@ -166,6 +176,10 @@ class QBittorrentClient:
         retry: bool = True,
         **kwargs: Any
     ) -> tuple[Optional[int], Optional[str]]:
+        from datetime import datetime
+        now = datetime.now()
+        self.health_status.qbittorrent.last_check = now
+
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {self.settings.qbittorrent_api_key}"
         kwargs["headers"] = headers
@@ -190,9 +204,15 @@ class QBittorrentClient:
                         self.logger.error(
                             "qBittorrent API key rejected (HTTP 401) - check QBITTORRENT_API_KEY"
                         )
-                        self.health_status.healthy = False
-                        self.health_status.last_error = "API key auth failed (HTTP 401)"
+                        self.health_status.qbittorrent.connected = False
+                        self.health_status.qbittorrent.port_synced = False
+                        self.health_status.qbittorrent.status = ServiceStatus.AUTH_FAILED
+                        self.health_status.qbittorrent.last_error = "API key auth failed (HTTP 401)"
                         return response.status, content
+
+                    if response.status == 200:
+                        self.health_status.qbittorrent.connected = True
+                        self.health_status.qbittorrent.last_success = now
 
                     return response.status, content
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -202,6 +222,10 @@ class QBittorrentClient:
                 )
                 return await self._request_with_api_key(method, path, retry=False, **kwargs)
             self.logger.error(f"qBittorrent request to {path} failed: {str(e)}")
+            self.health_status.qbittorrent.connected = False
+            self.health_status.qbittorrent.port_synced = False
+            self.health_status.qbittorrent.status = ServiceStatus.ERROR
+            self.health_status.qbittorrent.last_error = f"Request failed: {str(e)}"
             return None, None
 
     async def _request_with_session(

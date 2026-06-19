@@ -1,9 +1,39 @@
 from typing import Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import Enum
 from pydantic import Field, ConfigDict
 from pydantic_settings import BaseSettings
 from typing_extensions import Annotated
+
+
+class ServiceStatus(str, Enum):
+    OK = "ok"
+    ERROR = "error"
+    AUTH_FAILED = "auth_failed"
+    PORT_MISMATCH = "port_mismatch"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class GluetunStatus:
+    connected: bool = False
+    status: ServiceStatus = ServiceStatus.UNKNOWN
+    port: Optional[int] = None
+    last_check: Optional[datetime] = None
+    last_error: Optional[str] = None
+    last_success: Optional[datetime] = None
+
+
+@dataclass
+class QBittorrentStatus:
+    connected: bool = False
+    status: ServiceStatus = ServiceStatus.UNKNOWN
+    port: Optional[int] = None
+    port_synced: bool = False
+    last_check: Optional[datetime] = None
+    last_error: Optional[str] = None
+    last_success: Optional[datetime] = None
 
 
 class Settings(BaseSettings):
@@ -77,9 +107,22 @@ class Settings(BaseSettings):
 
 @dataclass
 class HealthStatus:
-    healthy: bool
-    last_check: datetime
+    healthy: bool = False
+    last_check: Optional[datetime] = None
     last_port_change: Optional[datetime] = None
+    last_successful_sync: Optional[datetime] = None
     last_error: Optional[str] = None
     current_port: Optional[int] = None
-    uptime: timedelta = timedelta(seconds=0)
+    uptime: timedelta = field(default_factory=lambda: timedelta(seconds=0))
+    gluetun: GluetunStatus = field(default_factory=GluetunStatus)
+    qbittorrent: QBittorrentStatus = field(default_factory=QBittorrentStatus)
+
+    def update_last_check(self) -> None:
+        self.last_check = datetime.now()
+
+    def is_healthy(self) -> bool:
+        return (
+            self.gluetun.connected
+            and self.qbittorrent.connected
+            and self.qbittorrent.port_synced
+        )
