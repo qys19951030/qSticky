@@ -1,18 +1,20 @@
 import asyncio
 import json
 import logging
+from datetime import datetime
 from typing import Optional
 
 import aiohttp
 from aiohttp import ClientTimeout
 
-from .config import Settings
+from .config import HealthStatus, ServiceStatus, Settings
 
 
 class GluetunClient:
-    def __init__(self, settings: Settings, logger: logging.Logger):
+    def __init__(self, settings: Settings, logger: logging.Logger, health_status: HealthStatus):
         self.settings = settings
         self.logger = logger
+        self.health_status = health_status
         self.base_url = f"http://{settings.gluetun_host}:{settings.gluetun_port}"
 
     def _get_auth(self) -> tuple[Optional[aiohttp.BasicAuth], dict]:
@@ -26,14 +28,22 @@ class GluetunClient:
         return None, {}
 
     async def get_forwarded_port(self) -> Optional[int]:
+        now = datetime.now()
+        self.health_status.gluetun.last_check = now
         self.logger.debug("Attempting to get forwarded port from Gluetun")
 
         if self.settings.gluetun_auth_type not in ("basic", "apikey"):
             self.logger.error("Invalid auth type specified")
+            self.health_status.gluetun.connected = False
+            self.health_status.gluetun.status = ServiceStatus.ERROR
+            self.health_status.gluetun.last_error = "Invalid auth type specified"
+            self.health_status.gluetun.port = None
             return None
 
         max_attempts = 3
         base_delay = 2
+        last_error_msg = "Unknown error"
+        last_status = ServiceStatus.ERROR
 
         for attempt in range(max_attempts):
             try:
@@ -55,10 +65,17 @@ class GluetunClient:
                                 data = json.loads(content)
                                 port = data.get("port")
                                 self.logger.debug(f"Retrieved forwarded port: {port}")
+                                self.health_status.gluetun.connected = True
+                                self.health_status.gluetun.status = ServiceStatus.OK
+                                self.health_status.gluetun.port = port
+                                self.health_status.gluetun.last_error = None
+                                self.health_status.gluetun.last_success = now
                                 return port
                             except json.JSONDecodeError as e:
                                 self.logger.error(f"Failed to parse JSON response: {e}")
-                                return None
+                                last_error_msg = f"Failed to parse JSON response: {e}"
+                                last_status = ServiceStatus.ERROR
+                                break
                         elif response.status == 401:
                             # Temp fallback: Try legacy endpoint for users with old config.toml - REMOVE THIS IF YOU'RE LOOKING BACK AT THIS FOR SOME REASON
                             self.logger.warning(
@@ -78,35 +95,62 @@ class GluetunClient:
                                             f"Successfully retrieved port {port} from legacy endpoint. "
                                             "Please update your config.toml to include 'GET /v1/portforward'"
                                         )
+                                        self.health_status.gluetun.connected = True
+                                        self.health_status.gluetun.status = ServiceStatus.OK
+                                        self.health_status.gluetun.port = port
+                                        self.health_status.gluetun.last_error = None
+                                        self.health_status.gluetun.last_success = now
                                         return port
                                     except json.JSONDecodeError as e:
                                         self.logger.error(
                                             f"Failed to parse JSON response from legacy endpoint: {e}"
                                         )
-                                        return None
+                                        last_error_msg = f"Failed to parse legacy JSON: {e}"
+                                        last_status = ServiceStatus.ERROR
+                                        break
                                 elif legacy_response.status == 301:
                                     self.logger.error(
                                         "Legacy endpoint redirects to new endpoint, but new endpoint not "
                                         "authorised. Please update your config.toml: "
                                         "https://github.com/monstermuffin/qSticky/tree/main?tab=readme-ov-file#authentication-setup"
                                     )
-                                    return None
+                                    last_error_msg = (
+                                        "Authentication failed (HTTP 401): Please update your config.toml "
+                                        "to include 'GET /v1/portforward'"
+                                    )
+                                    last_status = ServiceStatus.AUTH_FAILED
+                                    break
                                 else:
+                                    # Both new and legacy endpoints returned 401 → real auth failure
                                     self.logger.error(
                                         f"Failed to get port from legacy endpoint: HTTP {legacy_response.status}"
                                     )
-                                    return None
+                                    last_error_msg = (
+                                        f"Authentication failed (HTTP 401 on both endpoints): "
+                                        f"verify {self.settings.gluetun_auth_type} credentials"
+                                    )
+                                    last_status = ServiceStatus.AUTH_FAILED
+                                    break
                         else:
                             self.logger.error(f"Failed to get port: HTTP {response.status}")
-                            return None
+                            last_error_msg = f"HTTP {response.status}"
+                            last_status = ServiceStatus.ERROR
+                            break
             except Exception as e:
                 delay = base_delay * (attempt + 1)
                 self.logger.warning(
                     f"Connection attempt {attempt + 1} failed: {str(e)}, retrying in {delay}s..."
                 )
-                await asyncio.sleep(delay)
+                last_error_msg = f"Connection error: {str(e)}"
+                last_status = ServiceStatus.ERROR
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(delay)
 
-        self.logger.error("All connection attempts to Gluetun failed")
+        self.health_status.gluetun.connected = False
+        self.health_status.gluetun.status = last_status
+        self.health_status.gluetun.last_error = last_error_msg
+        self.health_status.gluetun.port = None
+        self.logger.error(f"All connection attempts to Gluetun failed: {last_error_msg}")
         return None
 
     async def check_connectivity(self) -> bool:
